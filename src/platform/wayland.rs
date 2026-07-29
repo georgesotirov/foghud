@@ -110,6 +110,42 @@ fn unbind_hotkeys() {
     hyprctl(&lua);
 }
 
+/// Set when Hyprland reports that it reloaded its config.
+static CONFIG_RELOADED: AtomicBool = AtomicBool::new(false);
+
+/// Watches Hyprland's event socket for config reloads.
+///
+/// Reloading rebuilds the bind table from the config file, which silently drops
+/// anything added at runtime through `hyprctl eval` — including ours. Without
+/// this, editing any part of the Hyprland config while the overlay is up leaves
+/// F1-F4 dead until the overlay is restarted.
+fn watch_for_reloads() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixStream;
+
+    let (Some(signature), Some(runtime)) = (
+        std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE"),
+        std::env::var_os("XDG_RUNTIME_DIR"),
+    ) else {
+        return;
+    };
+    let socket = std::path::Path::new(&runtime)
+        .join("hypr")
+        .join(signature)
+        .join(".socket2.sock");
+
+    std::thread::spawn(move || {
+        let Ok(stream) = UnixStream::connect(&socket) else {
+            return;
+        };
+        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            if line.starts_with("configreloaded") {
+                CONFIG_RELOADED.store(true, Ordering::SeqCst);
+            }
+        }
+    });
+}
+
 // -------------------------------------------------------------------- state --
 
 struct Panel {
@@ -228,8 +264,13 @@ impl App {
         }
     }
 
-    /// Picks up config changes written by the CLI.
+    /// Picks up config changes written by the CLI, and re-asserts the hotkeys if
+    /// a Hyprland config reload dropped them.
     fn poll_config(&mut self, qh: &QueueHandle<Self>) {
+        if CONFIG_RELOADED.swap(false, Ordering::SeqCst) {
+            bind_hotkeys(&self.cfg);
+        }
+
         let mtime = config_mtime();
         if mtime == self.cfg_mtime {
             return;
@@ -282,6 +323,7 @@ fn run_inner() -> Result<()> {
 
     let cfg = Config::load();
     bind_hotkeys(&cfg);
+    watch_for_reloads();
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
