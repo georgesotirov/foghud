@@ -34,11 +34,25 @@ use crate::config::{self, Config};
 use crate::render;
 use std::time::{Duration, Instant};
 
-const HOTKEY_STYLE: usize = 1;
-const HOTKEY_SIZE: usize = 2;
-const HOTKEY_OPACITY: usize = 3;
-const HOTKEY_COLOR: usize = 4;
 const CONFIG_POLL_TIMER: usize = 100;
+
+/// `RegisterHotKey` ids are just this backend's index into
+/// [`config::HOTKEYS`], offset by one because 0 is not a usable id. Deriving
+/// them keeps the Windows mapping in lockstep with the Wayland one — remapping a
+/// key means editing that table and nothing else.
+fn hotkey_id(index: usize) -> i32 {
+    index as i32 + 1
+}
+
+fn vk_for(key: &str) -> Option<u32> {
+    Some(match key {
+        "F1" => VK_F1.0 as u32,
+        "F2" => VK_F2.0 as u32,
+        "F3" => VK_F3.0 as u32,
+        "F4" => VK_F4.0 as u32,
+        _ => return None,
+    })
+}
 
 struct Monitor {
     name: String,
@@ -88,34 +102,36 @@ fn monitors() -> Vec<Monitor> {
     list
 }
 
-/// Monitors the crosshair should appear on, per the `monitor` setting.
-fn selected(cfg: &Config) -> Vec<Monitor> {
-    let all = monitors();
-    match cfg.monitor.as_str() {
-        "all" => all,
-        "primary" => all.into_iter().take(1).collect(),
-        name => {
-            let want = name.to_ascii_lowercase();
-            all.into_iter()
-                .filter(|m| {
-                    let lower = m.name.to_ascii_lowercase();
-                    // Accept both the raw device name and a friendlier suffix,
-                    // so `DISPLAY2` matches `\\.\DISPLAY2`.
-                    lower == want || lower.ends_with(&want)
-                })
-                .collect()
-        }
-    }
+/// Trims the `\\.\` that Windows prefixes device names with, so a widget's
+/// `monitor` can be set to the friendlier `DISPLAY2`.
+fn display_name(raw: &str) -> &str {
+    raw.rsplit('\\').next().unwrap_or(raw)
 }
 
-/// Paints one window with the current crosshair.
-fn present(hwnd: HWND, rect: RECT, cfg: &Config, notice: Option<&str>) -> Result<()> {
+/// Paints one window with whatever widgets belong on its screen.
+///
+/// A window is created for every monitor and the renderer decides what lands on
+/// each, so this may legitimately present an entirely transparent buffer.
+fn present(
+    hwnd: HWND,
+    rect: RECT,
+    cfg: &Config,
+    name: &str,
+    index: usize,
+    notice: Option<&str>,
+) -> Result<()> {
     let width = (rect.right - rect.left).max(1);
     let height = (rect.bottom - rect.top).max(1);
 
-    let mut pixmap = render::draw(cfg, width as u32, height as u32);
+    let screen = render::Screen {
+        name,
+        index,
+        width: width as u32,
+        height: height as u32,
+    };
+    let mut pixmap = render::draw(cfg, &screen);
     if let Some(text) = notice {
-        render::draw_hint(&mut pixmap, cfg, text);
+        render::draw_hint(&mut pixmap, cfg, &screen, text);
     }
     let bgra = render::to_bgra(&pixmap);
 
@@ -188,15 +204,11 @@ fn present(hwnd: HWND, rect: RECT, cfg: &Config, notice: Option<&str>) -> Result
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_HOTKEY => {
-            let what = match wparam.0 {
-                HOTKEY_STYLE => "style",
-                HOTKEY_SIZE => "size",
-                HOTKEY_OPACITY => "opacity",
-                HOTKEY_COLOR => "color",
-                _ => return LRESULT(0),
+            let Some((_, what)) = config::HOTKEYS.get(wparam.0.wrapping_sub(1)) else {
+                return LRESULT(0);
             };
             let mut cfg = Config::load();
-            if let Some(hint) = config::apply_cycle(&mut cfg, what) {
+            if let Some(hint) = config::apply_cycle(cfg.ensure_crosshair(), what) {
                 cfg.set_notice(hint);
                 // Saving is enough: the poll timer notices and repaints, so a
                 // hotkey press and a CLI change take exactly the same path.
@@ -217,18 +229,19 @@ fn register_hotkeys(hwnd: HWND, cfg: &Config) {
         return;
     }
     let none = HOT_KEY_MODIFIERS(0);
-    unsafe {
-        let _ = RegisterHotKey(Some(hwnd), HOTKEY_STYLE as i32, none, VK_F1.0 as u32);
-        let _ = RegisterHotKey(Some(hwnd), HOTKEY_SIZE as i32, none, VK_F2.0 as u32);
-        let _ = RegisterHotKey(Some(hwnd), HOTKEY_OPACITY as i32, none, VK_F3.0 as u32);
-        let _ = RegisterHotKey(Some(hwnd), HOTKEY_COLOR as i32, none, VK_F4.0 as u32);
+    for (index, (key, _)) in config::HOTKEYS.iter().enumerate() {
+        if let Some(vk) = vk_for(key) {
+            unsafe {
+                let _ = RegisterHotKey(Some(hwnd), hotkey_id(index), none, vk);
+            }
+        }
     }
 }
 
 fn unregister_hotkeys(hwnd: HWND) {
     unsafe {
-        for id in [HOTKEY_STYLE, HOTKEY_SIZE, HOTKEY_OPACITY, HOTKEY_COLOR] {
-            let _ = UnregisterHotKey(Some(hwnd), id as i32);
+        for index in 0..config::HOTKEYS.len() {
+            let _ = UnregisterHotKey(Some(hwnd), hotkey_id(index));
         }
     }
 }
@@ -262,14 +275,16 @@ fn run_inner() -> Result<()> {
         // A zero return usually just means the class is already registered.
         RegisterClassW(&class);
 
-        let targets = selected(&cfg);
+        let targets = monitors();
         if targets.is_empty() {
-            anyhow::bail!("no display matched monitor = '{}'", cfg.monitor);
+            anyhow::bail!("no displays found");
         }
 
-        let mut overlays: Vec<(HWND, RECT)> = Vec::new();
-        for monitor in &targets {
+        // (window, its screen rect, display name, output index)
+        let mut overlays: Vec<(HWND, RECT, String, usize)> = Vec::new();
+        for (index, monitor) in targets.iter().enumerate() {
             let r = monitor.rect;
+            let name = display_name(&monitor.name).to_string();
             let hwnd = CreateWindowExW(
                 WS_EX_LAYERED
                     | WS_EX_TRANSPARENT
@@ -291,8 +306,8 @@ fn run_inner() -> Result<()> {
             .context("creating the overlay window")?;
 
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            present(hwnd, r, &cfg, None)?;
-            overlays.push((hwnd, r));
+            present(hwnd, r, &cfg, &name, index, None)?;
+            overlays.push((hwnd, r, name, index));
         }
 
         // Hotkeys belong to one window; the first is as good as any.
@@ -343,8 +358,8 @@ fn run_inner() -> Result<()> {
                     } else {
                         None
                     };
-                    for (hwnd, rect) in &overlays {
-                        let _ = present(*hwnd, *rect, &cfg, text);
+                    for (hwnd, rect, name, index) in &overlays {
+                        let _ = present(*hwnd, *rect, &cfg, name, *index, text);
                     }
                 }
                 continue;
@@ -354,9 +369,35 @@ fn run_inner() -> Result<()> {
         }
 
         unregister_hotkeys(owner);
-        for (hwnd, _) in overlays {
+        for (hwnd, ..) in overlays {
             let _ = DestroyWindow(hwnd);
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_names_are_trimmed_to_something_typeable() {
+        assert_eq!(display_name(r"\\.\DISPLAY2"), "DISPLAY2");
+        assert_eq!(display_name("DISPLAY1"), "DISPLAY1");
+        assert_eq!(display_name(""), "");
+    }
+
+    #[test]
+    fn hotkey_ids_are_one_based_and_map_back() {
+        // wndproc turns a WM_HOTKEY id straight back into a table index, so an
+        // off-by-one here would silently cycle the wrong setting.
+        for (index, (key, what)) in config::HOTKEYS.iter().enumerate() {
+            let id = hotkey_id(index);
+            assert!(id > 0, "0 is not a usable RegisterHotKey id");
+            let back = (id as usize).wrapping_sub(1);
+            assert_eq!(config::HOTKEYS[back], (*key, *what));
+        }
+        assert!(vk_for("F1").is_some());
+        assert!(vk_for("F9").is_none());
+    }
 }

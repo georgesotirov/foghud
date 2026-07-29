@@ -38,9 +38,10 @@ section is the most valuable part.
 
 ```
 src/
-  config.rs    settings, colour parsing, hotkey cycles     portable
-  render.rs    crosshair + hint rasteriser (tiny-skia)     portable
-  text.rs      glyph rasterising (fontdue, embedded font)  portable
+  config.rs    widget list, colour parsing, hotkey table    portable
+  render.rs    widget + hint rasteriser (tiny-skia)         portable
+  text.rs      glyph rasterising (fontdue, embedded font)   portable
+  gui.rs       control panel (eframe/egui)                  portable
   daemon.rs    start/stop/find the overlay process
   platform/
     wayland.rs wlr-layer-shell surface + hyprctl hotkeys
@@ -52,19 +53,54 @@ Rules that hold this together:
 - **The rasteriser is platform-independent and stays that way.** Both backends
   present the same BGRA buffer. Never put platform conditionals in `render.rs`
   or `text.rs`.
-- **The config file is the entire IPC layer.** The CLI writes JSON; the running
-  overlay polls mtime every 150ms and redraws. No socket, no protocol.
+- **The config file is the entire IPC layer.** The CLI, the GUI and the hotkeys
+  all just write JSON; the running overlay polls mtime every 150ms and redraws.
+  No socket, no protocol. The GUI is *not* privileged — it holds no state the
+  overlay needs, and it watches the file so a hotkey press updates it too.
 - **Config writes are in place, never rename-over.** A rename swaps the inode and
   breaks the overlay's file watch.
+- **Settings are a list of widgets.** Each carries its own `monitor`, `anchor`,
+  offset and `opacity`; the crosshair is one `Kind`. A clock or timer is a new
+  variant plus a draw arm, not a reshuffle. Match on `Kind` exhaustively rather
+  than using `if let`, so a new variant fails to compile at every site that
+  needs updating.
+- **Monitor selection belongs to `render.rs`, not the backends.** Both backends
+  create a surface on every output and pass a `Screen { name, index, w, h }`;
+  the per-widget filter is applied while drawing. Don't reintroduce
+  per-backend monitor logic — it was duplicated and untestable.
+- **`config::HOTKEYS` is the only hotkey mapping**, and `config::label` the only
+  place a value's wording lives. Both backends and the hint panel derive from
+  them so they cannot drift. Remapping a key = editing that array.
 - **Anything drawable must be unit-testable.** Tests assert on actual pixels —
   see `render.rs` and `text.rs`. New drawing gets new pixel tests.
 - **Crosshair commands live at the top level** (`foghud size 14`), not under a
-  `crosshair` noun. Future features get their own noun (`foghud stats`).
+  `crosshair` noun. Future features get their own noun (`foghud clock`,
+  `foghud stats`).
+- **Keep `LegacyConfig`** until no pre-widget config files are plausibly in the
+  wild. It's what stops an upgrade silently resetting a tuned crosshair.
 
 ## Environment traps on this machine
 
-- **Hyprland's config is Lua**, so `hyprctl keyword` fails with "keyword can't
-  work with non-legacy parsers". Use `hyprctl eval 'hl.bind(...)'`.
+- **Hyprland's config is Lua**, so anything with a shorthand form fails against
+  the non-legacy parser. Both `hyprctl keyword` *and* `hyprctl dispatch` are out:
+  `hyprctl dispatch setfloating pid:1` becomes `hl.dispatch(setfloating pid:1)`
+  and won't parse. Write real Lua through `hyprctl eval`:
+  `hl.bind(...)`, `hl.dispatch(hl.dsp.window.float({ window = "pid:1" }))`.
+- **Never interpolate a path into a bind command unquoted.** This repo lives
+  under `Coding Projects` — a path *with a space*. Unquoted, the shell splits it
+  and the hotkey silently does nothing. Use `shell_quote`; the tests in
+  `wayland.rs` are the only guard, since the string crosses into an interpreter.
+- **`hyprctl binds` will lie to you about Lua binds.** They show as
+  `dispatcher: __lua` with an opaque numeric `arg` — the command string is *not*
+  in that output. Grepping it for your command finds nothing either way.
+- **`hyprctl eval` returning `ok` only means the Lua parsed.** A bind with a
+  broken command still answers `ok`; the command fails later, in a child process,
+  with nobody reading its stderr. **Verify hotkeys by pressing keys.**
+- **`hyprctl eval` discards return values, but errors come back.** To inspect the
+  Lua API, raise one:
+  `hyprctl eval 'local t={} for k in pairs(hl.dsp) do t[#t+1]=k end error(table.concat(t,","))'`
+- **`hl.dsp.window.float` is a toggle**, not a setter. Check `hyprctl clients -j`
+  first or you'll tile the window you meant to float.
 - **Hyprland stacks duplicate binds.** Always `hl.unbind` before `hl.bind`, or
   the action fires twice.
 - **`hyprctl reload` wipes every runtime bind.** The overlay watches
@@ -75,6 +111,12 @@ Rules that hold this together:
   round-trip per Windows change and batch them.
 - `~/.local/bin/foghud` symlinks the **release** binary. `cargo build` alone
   won't update what the `foghud` command runs.
+- **egui 0.35 differs from most examples.** `eframe::App` has
+  `fn ui(&mut self, ui: &mut Ui, frame: &mut Frame)` — no `update`, no `&Context`
+  parameter. `SidePanel`/`TopBottomPanel` are replaced by one `Panel` type whose
+  `show` takes `&mut Ui`. Check the vendored source, not tutorials.
+- **Test JSON containing a colour needs `r##"..."##`.** `"#` closes an `r#"..."#`
+  raw string early.
 
 ## Before you commit
 
@@ -94,6 +136,11 @@ Changes to drawing get checked with a real screenshot:
 ```bash
 foghud start && grim -g "1230,670 120x120" /tmp/shot.png
 ```
+
+**A hotkey is only verified by a real key press.** Registering the bind, and even
+running its command by hand, both pass while the hotkey is dead — that is exactly
+how the F1-F4 breakage survived a "verified" note. Either press the key or say
+you didn't.
 
 State plainly what was verified visually and what wasn't. The Windows backend in
 particular compiles but **has never been run** — say so rather than implying it

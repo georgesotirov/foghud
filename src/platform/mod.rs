@@ -18,6 +18,39 @@ mod wayland;
 #[cfg(windows)]
 mod windows;
 
+/// Best-effort request that the control panel be floated at this size rather
+/// than tiled into whatever slot the layout has spare.
+///
+/// A no-op anywhere it doesn't apply — Windows floats ordinary windows already.
+pub fn float_control_panel(width: u32, height: u32) {
+    #[cfg(target_os = "linux")]
+    {
+        wayland::float_window(width, height);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (width, height);
+    }
+}
+
+/// Display names of the connected outputs, for the control panel's monitor
+/// dropdown.
+///
+/// Empty when they can't be determined, which the panel treats as "offer only
+/// `all` and `primary`" and leaves its free-text field to do the rest. Nothing
+/// depends on this being complete or correct — it's a convenience, and the
+/// authoritative matching happens in `Widget::wants_screen`.
+pub fn monitor_names() -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        wayland::monitor_names()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
 /// Runs the overlay until it's asked to stop. Blocks.
 pub fn run_overlay() -> Result<()> {
     #[cfg(target_os = "linux")]

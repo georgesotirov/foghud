@@ -40,7 +40,7 @@ use wayland_client::{
     protocol::{wl_output, wl_shm, wl_surface},
 };
 
-use crate::config::Config;
+use crate::config::{Config, HOTKEYS};
 use crate::render;
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
@@ -60,24 +60,66 @@ fn install_signal_handlers() {
 
 // ------------------------------------------------------------------ hotkeys --
 
-const HOTKEYS: [(&str, &str); 4] = [
-    ("F1", "style"),
-    ("F2", "size"),
-    ("F3", "opacity"),
-    ("F4", "color"),
-];
-
 fn on_hyprland() -> bool {
     std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
 }
 
 fn hyprctl(lua: &str) {
-    let _ = std::process::Command::new("hyprctl")
+    let output = std::process::Command::new("hyprctl")
         .arg("eval")
         .arg(lua)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+        .output();
+    // `eval` reports only whether the Lua parsed — a bind whose *command* is
+    // broken still answers "ok", because that command doesn't run until the key
+    // is pressed, in a child process nothing here can see. So this catches very
+    // little; the tests below are the real guard. Surfaced anyway because
+    // `foghud run` in a terminal is how the hotkeys get debugged.
+    if let Ok(out) = output
+        && !out.status.success()
+    {
+        eprintln!(
+            "foghud: hyprctl eval failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+}
+
+/// Wraps a string in single quotes for the shell, escaping embedded quotes.
+///
+/// This exists because the overlay's own path goes into the bind command, and
+/// that path is entirely outside our control — it's wherever the user cloned the
+/// repo. An unquoted path containing a space silently broke every hotkey: the
+/// shell split it, `exec_cmd` got a nonexistent program, and the failure went to
+/// a child process whose stderr nobody reads.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Escapes a string for use inside a Lua double-quoted literal.
+fn lua_escape(s: &str) -> String {
+    s.replace('\\', r"\\").replace('"', "\\\"")
+}
+
+/// The Lua handed to `hyprctl eval` to claim every hotkey.
+///
+/// Split out from [`bind_hotkeys`] purely so it can be tested: this is a string
+/// crossing a process boundary into an interpreter, so the compiler checks
+/// nothing about it and a typo here is invisible until a key is pressed.
+fn bind_script(exe: &str) -> String {
+    HOTKEYS
+        .iter()
+        .map(|(key, what)| {
+            let cmd = lua_escape(&format!("{} cycle {what}", shell_quote(exe)));
+            format!(r#"hl.bind("{key}", hl.dsp.exec_cmd("{cmd}")) "#)
+        })
+        .collect()
+}
+
+fn unbind_script() -> String {
+    HOTKEYS
+        .iter()
+        .map(|(key, _)| format!(r#"hl.unbind("{key}") "#))
+        .collect()
 }
 
 fn bind_hotkeys(cfg: &Config) {
@@ -90,22 +132,111 @@ fn bind_hotkeys(cfg: &Config) {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "foghud".into());
-    let lua: String = HOTKEYS
-        .iter()
-        .map(|(key, what)| format!(r#"hl.bind("{key}", hl.dsp.exec_cmd("{exe} cycle {what}")) "#))
-        .collect();
-    hyprctl(&lua);
+    hyprctl(&bind_script(&exe));
 }
 
 fn unbind_hotkeys() {
     if !on_hyprland() {
         return;
     }
-    let lua: String = HOTKEYS
+    hyprctl(&unbind_script());
+}
+
+/// Runs one Lua dispatcher through `hyprctl eval`.
+///
+/// Note this is *not* `hyprctl dispatch <name> <args>`. On a Lua config that
+/// shorthand expands to `hl.dispatch(<raw text>)` and fails to parse — the same
+/// non-legacy-parser trap that rules out `hyprctl keyword`. Everything has to be
+/// written as real Lua.
+fn hypr_dispatch(lua: &str) {
+    hyprctl(&format!("hl.dispatch({lua})"));
+}
+
+/// Whether the window belonging to `pid` is floating, or `None` if Hyprland
+/// doesn't know about such a window yet.
+fn is_floating(pid: u32) -> Option<bool> {
+    let out = std::process::Command::new("hyprctl")
+        .args(["clients", "-j"])
+        .output()
+        .ok()?;
+    let clients: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    clients
+        .as_array()?
         .iter()
-        .map(|(key, _)| format!(r#"hl.unbind("{key}") "#))
-        .collect();
-    hyprctl(&lua);
+        .find(|c| c.get("pid").and_then(serde_json::Value::as_u64) == Some(pid as u64))
+        .and_then(|c| c.get("floating")?.as_bool())
+}
+
+/// Asks Hyprland to float, size and centre the control panel.
+///
+/// A tiling layout hands a settings window whatever slot happens to be spare —
+/// in testing that was a 1082x201 strip, which is unusable. Wayland gives a
+/// client no way to request floating, and `inner_size` is only a hint the
+/// compositor may ignore, so this asks the compositor directly, exactly as the
+/// hotkeys do.
+///
+/// Best effort and silent: a tiled panel is a nuisance, not a failure, and anyone
+/// who wants it tiled can say so with their own window rule.
+pub fn float_window(width: u32, height: u32) {
+    if !on_hyprland() {
+        return;
+    }
+    let pid = std::process::id();
+    // On its own thread: the window doesn't exist for Hyprland to match until
+    // it's mapped, and the first frame must not block on `hyprctl`.
+    std::thread::spawn(move || {
+        // Wait for the window to appear rather than guessing a delay.
+        let mut floating = None;
+        for _ in 0..20 {
+            floating = is_floating(pid);
+            if floating.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let Some(floating) = floating else {
+            return;
+        };
+
+        let target = format!("window = \"pid:{pid}\"");
+        // `float` is a *toggle*, so calling it on an already-floating window
+        // would tile the thing we're trying to rescue.
+        if !floating {
+            hypr_dispatch(&format!("hl.dsp.window.float({{ {target} }})"));
+        }
+        hypr_dispatch(&format!(
+            "hl.dsp.window.resize({{ {target}, x = {width}, y = {height}, exact = true }})"
+        ));
+        hypr_dispatch(&format!("hl.dsp.window.center({{ {target} }})"));
+    });
+}
+
+/// Output names as the compositor reports them.
+///
+/// Asks `hyprctl` rather than opening a Wayland connection: the panel needs this
+/// while the overlay may already hold the outputs, and shelling out avoids a
+/// second client for a list of strings. Any failure is just an empty list.
+pub fn monitor_names() -> Vec<String> {
+    if !on_hyprland() {
+        return Vec::new();
+    }
+    let Ok(out) = std::process::Command::new("hyprctl")
+        .args(["monitors", "-j"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return Vec::new();
+    };
+    value
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|m| m.get("name")?.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Set when Hyprland reports that it reloaded its config.
@@ -149,6 +280,10 @@ fn watch_for_reloads() {
 struct Panel {
     layer: LayerSurface,
     output: wl_output::WlOutput,
+    /// Display name and position in the output list, passed to the renderer so
+    /// it can apply each widget's own `monitor` setting.
+    name: String,
+    index: usize,
     width: u32,
     height: u32,
     configured: bool,
@@ -184,27 +319,24 @@ fn config_mtime() -> Option<SystemTime> {
 }
 
 impl App {
-    /// True when this output should carry a crosshair.
-    fn wants_output(&self, output: &wl_output::WlOutput, index: usize) -> bool {
-        match self.cfg.monitor.as_str() {
-            "all" => true,
-            "primary" => index == 0,
-            name => self
-                .output_state
-                .info(output)
-                .and_then(|i| i.name)
-                .is_some_and(|n| n.eq_ignore_ascii_case(name)),
-        }
-    }
-
+    /// Puts a surface on **every** output, unconditionally.
+    ///
+    /// Which widgets actually appear on which screen is the renderer's job now
+    /// that each widget carries its own `monitor` setting — a surface that ends
+    /// up with nothing on it just presents a transparent buffer. That costs one
+    /// idle buffer per unused monitor and removes a whole class of bug: panels no
+    /// longer need rebuilding when a monitor setting changes, so there's no
+    /// window during which the overlay has torn down its surfaces.
     fn rebuild_panels(&mut self, qh: &QueueHandle<Self>) {
         self.needs_rebuild = false;
         self.panels.clear();
         let outputs: Vec<_> = self.output_state.outputs().collect();
         for (i, output) in outputs.into_iter().enumerate() {
-            if !self.wants_output(&output, i) {
-                continue;
-            }
+            let name = self
+                .output_state
+                .info(&output)
+                .and_then(|info| info.name)
+                .unwrap_or_default();
             let surface = self.compositor.create_surface(qh);
 
             // An empty input region is what makes every click fall through to
@@ -229,6 +361,8 @@ impl App {
             self.panels.push(Panel {
                 layer,
                 output,
+                name,
+                index: i,
                 width: 0,
                 height: 0,
                 configured: false,
@@ -244,13 +378,22 @@ impl App {
             return;
         }
         let (w, h) = (panel.width, panel.height);
+        // Copied out so the pool can be borrowed mutably further down.
+        let name = panel.name.clone();
+        let output_index = panel.index;
         let stride = w as i32 * 4;
 
         let show_notice = self.notice_visible();
         self.notice_drawn = show_notice;
-        let mut pixmap = render::draw(&self.cfg, w, h);
+        let screen = render::Screen {
+            name: &name,
+            index: output_index,
+            width: w,
+            height: h,
+        };
+        let mut pixmap = render::draw(&self.cfg, &screen);
         if show_notice {
-            render::draw_hint(&mut pixmap, &self.cfg, &self.notice);
+            render::draw_hint(&mut pixmap, &self.cfg, &screen, &self.notice);
         }
         let bgra = render::to_bgra(&pixmap);
 
@@ -314,7 +457,6 @@ impl App {
         }
         self.cfg_mtime = mtime;
 
-        let old_monitor = self.cfg.monitor.clone();
         let old_hotkeys = self.cfg.hotkeys;
         self.cfg = Config::load();
 
@@ -324,10 +466,9 @@ impl App {
             self.show_notice(text);
         }
 
-        if self.cfg.monitor != old_monitor {
-            self.rebuild_panels(qh);
-            return; // configure events will draw
-        }
+        // Note there is no rebuild on a monitor change any more: surfaces exist
+        // on every output regardless, so moving a widget between monitors is
+        // just the next redraw.
         if self.cfg.hotkeys != old_hotkeys {
             if self.cfg.hotkeys {
                 bind_hotkeys(&self.cfg);
@@ -528,3 +669,86 @@ impl ProvidesRegistryState for App {
 // the wiring the handlers above need.
 delegate_registry!(App);
 smithay_client_toolkit::delegate_dispatch2!(App);
+
+// ------------------------------------------------------------------- tests ---
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug this whole quoting layer exists for. The overlay lives at
+    /// whatever path the user cloned it to; ours contains a space, and the
+    /// unquoted form made `sh` try to run `/mnt/storage/Coding`.
+    #[test]
+    fn quoted_path_survives_the_shell() {
+        let path = "/mnt/storage/Coding Projects/foghud/target/release/foghud";
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {}", shell_quote(path)))
+            .output()
+            .expect("sh should be available");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            path,
+            "the shell must hand the path back in one piece"
+        );
+    }
+
+    #[test]
+    fn shell_quote_handles_an_embedded_quote() {
+        let path = "/home/it's odd/foghud";
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {}", shell_quote(path)))
+            .output()
+            .expect("sh should be available");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), path);
+    }
+
+    #[test]
+    fn bind_script_quotes_the_executable() {
+        let lua = bind_script("/a b/foghud");
+        assert!(
+            lua.contains(r#"hl.bind("F1", hl.dsp.exec_cmd("'/a b/foghud' cycle style"))"#),
+            "unexpected Lua: {lua}"
+        );
+        // The exact shape that was broken: path sitting bare against its args.
+        assert!(
+            !lua.contains("(\"/a b/foghud cycle"),
+            "the executable path must never be passed unquoted: {lua}"
+        );
+    }
+
+    #[test]
+    fn bind_script_covers_every_hotkey() {
+        let lua = bind_script("/opt/foghud");
+        for (key, what) in HOTKEYS {
+            assert!(
+                lua.contains(&format!(r#"hl.bind("{key}""#)),
+                "{key} missing"
+            );
+            assert!(lua.contains(&format!("cycle {what}")), "{what} missing");
+        }
+        assert_eq!(unbind_script().matches("hl.unbind").count(), HOTKEYS.len());
+    }
+
+    /// Guards the mapping itself, which is the part a user notices.
+    #[test]
+    fn hotkeys_are_type_size_color_opacity() {
+        assert_eq!(
+            HOTKEYS,
+            [
+                ("F1", "style"),
+                ("F2", "size"),
+                ("F3", "color"),
+                ("F4", "opacity"),
+            ]
+        );
+    }
+
+    #[test]
+    fn lua_escape_protects_quotes_and_backslashes() {
+        assert_eq!(lua_escape(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(lua_escape(r"a\b"), r"a\\b");
+    }
+}

@@ -1,32 +1,37 @@
 mod config;
 mod daemon;
+mod gui;
 mod platform;
 mod render;
 mod text;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use config::{Config, Style, full_hint, percent};
+use config::{Anchor, Config, Style, Widget, full_hint};
 
 #[derive(Parser)]
 #[command(
     name = "foghud",
     version,
     about = "Overlay toolkit for Dead by Daylight",
-    long_about = "Overlay toolkit for Dead by Daylight.\n\nRuns outside the game as an ordinary \
-                  desktop overlay — it never reads, writes or injects into the game process."
+    long_about = "Overlay toolkit for Dead by Daylight.\n\nRun with no arguments to open the \
+                  control panel. Runs outside the game as an ordinary desktop overlay — it never \
+                  reads, writes or injects into the game process."
 )]
 struct Cli {
+    /// With no subcommand, `foghud` opens the control panel.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 /// Crosshair commands sit at the top level rather than under a `crosshair`
 /// noun: it's the thing you reach for constantly, and `foghud size 14` beats
-/// `foghud crosshair size 14` several times a match. Later features get their
-/// own noun (`foghud stats`).
+/// `foghud crosshair size 14` several times a match. Later widget kinds get
+/// their own noun (`foghud clock ...`).
 #[derive(Subcommand)]
 enum Command {
+    /// Open the control panel
+    Gui,
     /// Start the overlay
     Start,
     /// Stop the overlay process
@@ -76,7 +81,11 @@ enum Command {
     Monitor {
         value: String,
     },
-    /// Nudge away from the centre of the screen
+    /// Where the offset is measured from: center, topLeft, bottomRight, ...
+    Anchor {
+        value: String,
+    },
+    /// Nudge away from the anchor
     Offset {
         x: f32,
         y: f32,
@@ -121,9 +130,12 @@ fn main() {
 
 fn run() -> Result<()> {
     match Cli::parse().command {
-        Command::Run => platform::run_overlay(),
-        Command::Config { action } => config_cmd(action),
-        other => crosshair(other),
+        // Bare `foghud` opens the panel: the common case is wanting to look at
+        // the thing, not to remember a verb.
+        None | Some(Command::Gui) => gui::run(),
+        Some(Command::Run) => platform::run_overlay(),
+        Some(Command::Config { action }) => config_cmd(action),
+        Some(other) => crosshair(other),
     }
 }
 
@@ -145,26 +157,37 @@ fn config_cmd(action: ConfigCmd) -> Result<()> {
     Ok(())
 }
 
-/// Load, mutate, save. Every setting change goes through here.
-fn update(f: impl FnOnce(&mut Config) -> Result<()>) -> Result<()> {
+/// Load, mutate the crosshair widget, save. Every setting change goes through
+/// here or [`update_hinted`].
+fn update(f: impl FnOnce(&mut Widget) -> Result<()>) -> Result<()> {
     let mut cfg = Config::load();
-    f(&mut cfg)?;
+    f(cfg.ensure_crosshair())?;
     cfg.save()
 }
 
-/// Like [`update`], but also raises a hint panel describing what changed. The
-/// hint is built after the mutation so it reports the new value.
-fn update_with_hint(
-    hint: impl FnOnce(&Config) -> String,
-    f: impl FnOnce(&mut Config) -> Result<()>,
-) -> Result<()> {
+/// Like [`update`], but also raises a hint panel naming the setting that
+/// changed. The label comes from `config::label`, so a CLI change and a hotkey
+/// press describe themselves with the same words.
+fn update_hinted(what: &str, f: impl FnOnce(&mut Widget) -> Result<()>) -> Result<()> {
     let mut cfg = Config::load();
-    f(&mut cfg)?;
-    cfg.set_notice(hint(&cfg));
+    f(cfg.ensure_crosshair())?;
+    if let Some(hint) = config::label(cfg.ensure_crosshair(), what) {
+        cfg.set_notice(hint);
+    }
     cfg.save()
 }
 
-fn start() -> Result<()> {
+/// Turns the crosshair on and shows the full key listing.
+fn switch_on() -> Result<()> {
+    let mut cfg = Config::load();
+    let widget = cfg.ensure_crosshair();
+    widget.enabled = true;
+    let hint = full_hint(cfg.ensure_crosshair());
+    cfg.set_notice(hint);
+    cfg.save()
+}
+
+pub fn start() -> Result<()> {
     if daemon::is_running() {
         println!("crosshair is already running");
         return Ok(());
@@ -211,44 +234,36 @@ fn crosshair(action: Command) -> Result<()> {
         Command::Toggle => {
             // The first press of the hotkey doubles as "launch it".
             if !daemon::is_running() {
-                update_with_hint(full_hint, |c| {
-                    c.enabled = true;
-                    Ok(())
-                })?;
+                switch_on()?;
                 return start();
             }
-            if Config::load().enabled {
-                update(|c| {
-                    c.enabled = false;
+            if Config::load().crosshair().is_some_and(|w| w.enabled) {
+                update(|w| {
+                    w.enabled = false;
                     Ok(())
                 })?;
             } else {
-                update_with_hint(full_hint, |c| {
-                    c.enabled = true;
-                    Ok(())
-                })?;
+                switch_on()?;
             }
         }
 
         Command::On => {
-            update_with_hint(full_hint, |c| {
-                c.enabled = true;
-                Ok(())
-            })?;
+            switch_on()?;
             if !daemon::is_running() {
                 return start();
             }
         }
 
-        Command::Off => update(|c| {
-            c.enabled = false;
+        Command::Off => update(|w| {
+            w.enabled = false;
             Ok(())
         })?,
 
         Command::Status => {
             let cfg = Config::load();
             if daemon::is_running() {
-                let vis = if cfg.enabled { "visible" } else { "hidden" };
+                let visible = cfg.crosshair().is_some_and(|w| w.enabled);
+                let vis = if visible { "visible" } else { "hidden" };
                 println!("running, crosshair is {vis}");
             } else {
                 println!("not running");
@@ -257,92 +272,98 @@ fn crosshair(action: Command) -> Result<()> {
 
         Command::Color { value } => {
             require_color(&value)?;
-            update_with_hint(
-                |c| format!("color    {}", c.color),
-                |c| {
-                    c.color = value;
-                    Ok(())
-                },
-            )?
-        }
-
-        Command::OutlineColor { value } => {
-            require_color(&value)?;
-            update(|c| {
-                c.outline_color = value;
+            update_hinted("color", |w| {
+                w.crosshair_mut().expect("crosshair widget").color = value;
                 Ok(())
             })?
         }
 
-        Command::Size { value } => update_with_hint(
-            |c| format!("size     {}", c.size as i32),
-            |c| {
-                c.size = value.max(0.0);
+        Command::OutlineColor { value } => {
+            require_color(&value)?;
+            update(|w| {
+                w.crosshair_mut().expect("crosshair widget").outline_color = value;
                 Ok(())
-            },
-        )?,
+            })?
+        }
 
-        Command::Opacity { value } => update_with_hint(
-            |c| format!("opacity  {}", percent(c.opacity)),
-            |c| {
-                c.opacity = value.clamp(0.0, 1.0);
-                Ok(())
-            },
-        )?,
+        Command::Size { value } => update_hinted("size", |w| {
+            w.crosshair_mut().expect("crosshair widget").size = value.max(0.0);
+            Ok(())
+        })?,
+
+        Command::Opacity { value } => update_hinted("opacity", |w| {
+            w.opacity = value.clamp(0.0, 1.0);
+            Ok(())
+        })?,
 
         Command::Style { value } => {
             let Some(style) = Style::parse(&value) else {
                 bail!("unknown style '{value}' — pick one of: cross, tcross, circle, dot");
             };
-            update_with_hint(
-                |c| format!("style    {}", c.style.as_str()),
-                |c| {
-                    c.style = style;
-                    Ok(())
-                },
-            )?
+            update_hinted("style", |w| {
+                w.crosshair_mut().expect("crosshair widget").style = style;
+                Ok(())
+            })?
         }
 
-        Command::Thickness { value } => update(|c| {
-            c.thickness = value.max(1.0);
+        Command::Anchor { value } => {
+            let Some(anchor) = Anchor::parse(&value) else {
+                let names: Vec<&str> = Anchor::ALL.iter().map(|a| a.as_str()).collect();
+                bail!(
+                    "unknown anchor '{value}' — pick one of: {}",
+                    names.join(", ")
+                );
+            };
+            update(|w| {
+                w.anchor = anchor;
+                Ok(())
+            })?
+        }
+
+        Command::Thickness { value } => update(|w| {
+            w.crosshair_mut().expect("crosshair widget").thickness = value.max(1.0);
             Ok(())
         })?,
-        Command::Gap { value } => update(|c| {
-            c.gap = value.max(0.0);
+        Command::Gap { value } => update(|w| {
+            w.crosshair_mut().expect("crosshair widget").gap = value.max(0.0);
             Ok(())
         })?,
-        Command::Dot { value } => update(|c| {
-            c.dot = value.max(0.0);
+        Command::Dot { value } => update(|w| {
+            w.crosshair_mut().expect("crosshair widget").dot = value.max(0.0);
             Ok(())
         })?,
-        Command::Outline { value } => update(|c| {
-            c.outline = value.max(0.0);
+        Command::Outline { value } => update(|w| {
+            w.crosshair_mut().expect("crosshair widget").outline = value.max(0.0);
             Ok(())
         })?,
-        Command::Monitor { value } => update(|c| {
-            c.monitor = value;
+        Command::Monitor { value } => update(|w| {
+            w.monitor = value;
             Ok(())
         })?,
-        Command::Offset { x, y } => update(|c| {
-            c.offset_x = x;
-            c.offset_y = y;
+        Command::Offset { x, y } => update(|w| {
+            w.offset_x = x;
+            w.offset_y = y;
             Ok(())
         })?,
-        Command::Hotkeys { value } => update(|c| {
-            c.hotkeys = value;
-            Ok(())
-        })?,
+
+        // Hotkeys are global rather than per-widget, so this one bypasses the
+        // crosshair helpers.
+        Command::Hotkeys { value } => {
+            let mut cfg = Config::load();
+            cfg.hotkeys = value;
+            cfg.save()?;
+        }
 
         Command::Cycle { what } => {
             let mut cfg = Config::load();
-            let Some(hint) = config::apply_cycle(&mut cfg, &what) else {
-                bail!("cannot cycle '{what}' — try: style, size, opacity, color");
+            let Some(hint) = config::apply_cycle(cfg.ensure_crosshair(), &what) else {
+                bail!("cannot cycle '{what}' — try: style, size, color, opacity");
             };
             cfg.set_notice(hint);
             cfg.save()?;
         }
 
-        Command::Config { .. } | Command::Run => unreachable!("handled by run()"),
+        Command::Gui | Command::Config { .. } | Command::Run => unreachable!("handled by run()"),
     }
     Ok(())
 }
