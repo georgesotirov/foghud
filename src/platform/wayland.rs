@@ -7,8 +7,8 @@
 //! an empty input region.
 //!
 //! Hotkeys have no such escape hatch, so they go through the compositor. On
-//! Hyprland that means `hyprctl`, which binds F1-F4 to `foghud crosshair cycle`
-//! while the overlay is up and releases them when it exits.
+//! Hyprland that means `hyprctl`, which binds F1-F4 to `foghud cycle ...` while
+//! the overlay is up and releases them when it exits.
 
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -92,9 +92,7 @@ fn bind_hotkeys(cfg: &Config) {
         .unwrap_or_else(|_| "foghud".into());
     let lua: String = HOTKEYS
         .iter()
-        .map(|(key, what)| {
-            format!(r#"hl.bind("{key}", hl.dsp.exec_cmd("{exe} crosshair cycle {what}")) "#)
-        })
+        .map(|(key, what)| format!(r#"hl.bind("{key}", hl.dsp.exec_cmd("{exe} cycle {what}")) "#))
         .collect();
     hyprctl(&lua);
 }
@@ -167,6 +165,13 @@ struct App {
     cfg: Config,
     cfg_mtime: Option<SystemTime>,
     panels: Vec<Panel>,
+    /// Hint currently on screen, and when it should disappear.
+    notice: String,
+    notice_until: Option<std::time::Instant>,
+    /// Whether the last frame we painted included the hint. Comparing against
+    /// this is what makes an expiring hint trigger exactly one clearing redraw.
+    notice_drawn: bool,
+    last_notice_id: u64,
     needs_rebuild: bool,
     exit: bool,
 }
@@ -241,7 +246,12 @@ impl App {
         let (w, h) = (panel.width, panel.height);
         let stride = w as i32 * 4;
 
-        let pixmap = render::draw(&self.cfg, w, h);
+        let show_notice = self.notice_visible();
+        self.notice_drawn = show_notice;
+        let mut pixmap = render::draw(&self.cfg, w, h);
+        if show_notice {
+            render::draw_hint(&mut pixmap, &self.cfg, &self.notice);
+        }
         let bgra = render::to_bgra(&pixmap);
 
         let Ok((buffer, canvas)) =
@@ -266,6 +276,22 @@ impl App {
         }
     }
 
+    fn notice_visible(&self) -> bool {
+        self.notice_until
+            .is_some_and(|until| std::time::Instant::now() < until)
+    }
+
+    /// A full key listing stays up long enough to read; a single changed value
+    /// is a glance, so it goes away quickly.
+    fn show_notice(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        let secs = if text.contains('\n') { 4 } else { 2 };
+        self.notice_until = Some(std::time::Instant::now() + Duration::from_secs(secs));
+        self.notice = text;
+    }
+
     /// Picks up config changes written by the CLI, and re-asserts the hotkeys if
     /// a Hyprland config reload dropped them.
     fn poll_config(&mut self, qh: &QueueHandle<Self>) {
@@ -277,6 +303,11 @@ impl App {
             self.rebuild_panels(qh);
         }
 
+        // A hint that has timed out needs one more frame to wipe it away.
+        if self.notice_visible() != self.notice_drawn {
+            self.draw_all();
+        }
+
         let mtime = config_mtime();
         if mtime == self.cfg_mtime {
             return;
@@ -286,6 +317,12 @@ impl App {
         let old_monitor = self.cfg.monitor.clone();
         let old_hotkeys = self.cfg.hotkeys;
         self.cfg = Config::load();
+
+        if self.cfg.notice_id != self.last_notice_id {
+            self.last_notice_id = self.cfg.notice_id;
+            let text = self.cfg.notice.clone();
+            self.show_notice(text);
+        }
 
         if self.cfg.monitor != old_monitor {
             self.rebuild_panels(qh);
@@ -327,7 +364,8 @@ fn run_inner() -> Result<()> {
     let shm = Shm::bind(&globals, &qh).context("wl_shm unavailable")?;
     let pool = SlotPool::new(256 * 256 * 4, &shm).context("creating a buffer pool")?;
 
-    let cfg = Config::load();
+    let cfg_at_start = Config::load();
+    let cfg = cfg_at_start.clone();
     bind_hotkeys(&cfg);
     watch_for_reloads();
 
@@ -341,6 +379,10 @@ fn run_inner() -> Result<()> {
         cfg,
         cfg_mtime: config_mtime(),
         panels: Vec::new(),
+        notice: String::new(),
+        notice_until: None,
+        notice_drawn: false,
+        last_notice_id: cfg_at_start.notice_id,
         needs_rebuild: false,
         exit: false,
     };

@@ -136,6 +136,85 @@ pub fn draw(cfg: &Config, width: u32, height: u32) -> Pixmap {
     pixmap
 }
 
+// ------------------------------------------------------------------- hints --
+
+const HINT_TEXT_PX: f32 = 14.0;
+const HINT_PAD_X: f32 = 16.0;
+const HINT_PAD_Y: f32 = 11.0;
+const HINT_BG: [u8; 4] = [18, 21, 27, 238];
+const HINT_BORDER: [u8; 4] = [255, 255, 255, 51];
+const HINT_HEADING: [u8; 4] = [255, 255, 255, 255];
+const HINT_BODY: [u8; 4] = [168, 178, 193, 255];
+
+/// Draws the hint panel below the crosshair.
+///
+/// Deliberately drawn at full strength rather than through `cfg.opacity` — the
+/// panel is what tells you how to raise the opacity again, so fading it with the
+/// crosshair would make a dimmed crosshair impossible to recover from.
+pub fn draw_hint(pixmap: &mut Pixmap, cfg: &Config, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    let line_h = crate::text::line_height(HINT_TEXT_PX);
+    let widest = lines
+        .iter()
+        .map(|l| crate::text::measure(l, HINT_TEXT_PX))
+        .fold(0.0_f32, f32::max);
+
+    let box_w = widest + HINT_PAD_X * 2.0;
+    let box_h = line_h * lines.len() as f32 + HINT_PAD_Y * 2.0;
+
+    let cx = (pixmap.width() as f32 / 2.0 + cfg.offset_x).round();
+    let cy = (pixmap.height() as f32 / 2.0 + cfg.offset_y).round();
+
+    // Clear of the crosshair, and clamped so it stays on screen.
+    let below = cfg.size.max(0.0) + cfg.gap.max(0.0) + 34.0;
+    let box_x = (cx - box_w / 2.0)
+        .max(8.0)
+        .min(pixmap.width() as f32 - box_w - 8.0);
+    let box_y = (cy + below.max(48.0)).min(pixmap.height() as f32 - box_h - 8.0);
+
+    let id = Transform::identity();
+    if let Some(rect) = Rect::from_xywh(box_x, box_y, box_w, box_h) {
+        let mut bg = Paint::default();
+        bg.set_color_rgba8(HINT_BG[0], HINT_BG[1], HINT_BG[2], HINT_BG[3]);
+        bg.anti_alias = false;
+        pixmap.fill_rect(rect, &bg, id, None);
+
+        let mut border = Paint::default();
+        border.set_color_rgba8(
+            HINT_BORDER[0],
+            HINT_BORDER[1],
+            HINT_BORDER[2],
+            HINT_BORDER[3],
+        );
+        border.anti_alias = false;
+        let stroke = Stroke {
+            width: 1.0,
+            ..Default::default()
+        };
+        pixmap.stroke_path(&PathBuilder::from_rect(rect), &border, &stroke, id, None);
+    }
+
+    let ascent = crate::text::ascent(HINT_TEXT_PX);
+    for (i, line) in lines.iter().enumerate() {
+        // The first line is the heading — "Crosshair on", or the setting that
+        // just changed.
+        let color = if i == 0 { HINT_HEADING } else { HINT_BODY };
+        let baseline = box_y + HINT_PAD_Y + line_h * i as f32 + ascent;
+        crate::text::draw_on(
+            pixmap,
+            line,
+            box_x + HINT_PAD_X,
+            baseline,
+            HINT_TEXT_PX,
+            color,
+        );
+    }
+}
+
 /// tiny-skia hands back premultiplied RGBA; Wayland's ARGB8888 and Windows'
 /// `UpdateLayeredWindow` both want premultiplied BGRA. One swap serves both.
 pub fn to_bgra(pixmap: &Pixmap) -> Vec<u8> {

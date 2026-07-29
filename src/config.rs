@@ -89,6 +89,12 @@ pub struct Config {
     /// `all`, `primary`, or an output/display name such as `DP-3`.
     pub monitor: String,
     pub hotkeys: bool,
+
+    /// Text of the hint panel to show over the crosshair. Set by the CLI.
+    pub notice: String,
+    /// Bumped every time a new hint should be shown. The overlay watches this
+    /// rather than the text, so repeating the same hint still re-displays it.
+    pub notice_id: u64,
 }
 
 impl Default for Config {
@@ -108,6 +114,8 @@ impl Default for Config {
             offset_y: 0.0,
             monitor: "primary".into(),
             hotkeys: true,
+            notice: String::new(),
+            notice_id: 0,
         }
     }
 }

@@ -2,6 +2,7 @@ mod config;
 mod daemon;
 mod platform;
 mod render;
+mod text;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -20,26 +21,13 @@ struct Cli {
     command: Command,
 }
 
+/// Crosshair commands sit at the top level rather than under a `crosshair`
+/// noun: it's the thing you reach for constantly, and `foghud size 14` beats
+/// `foghud crosshair size 14` several times a match. Later features get their
+/// own noun (`foghud stats`).
 #[derive(Subcommand)]
 enum Command {
-    /// Crosshair overlay
-    Crosshair {
-        #[command(subcommand)]
-        action: Option<Crosshair>,
-    },
-    /// Inspect or reset the config file
-    Config {
-        #[command(subcommand)]
-        action: ConfigCmd,
-    },
-    /// Run the overlay in the foreground (used internally by `crosshair start`)
-    #[command(hide = true)]
-    Run,
-}
-
-#[derive(Subcommand)]
-enum Crosshair {
-    /// Start the overlay (the default when no action is given)
+    /// Start the overlay
     Start,
     /// Stop the overlay process
     Stop,
@@ -49,6 +37,7 @@ enum Crosshair {
     On,
     Off,
     Status,
+
     /// #rrggbb, #aarrggbb, or a name such as `cyan`
     Color {
         value: String,
@@ -92,15 +81,30 @@ enum Crosshair {
         x: f32,
         y: f32,
     },
-    /// Step a setting to its next preset (what the hotkeys call)
+    /// Turn the F1-F4 hotkeys on or off
+    Hotkeys {
+        value: bool,
+    },
+
+    /// Step a setting to its next preset (what F1-F4 call)
     Cycle {
         what: String,
     },
+
+    /// Inspect or reset the settings file
+    Config {
+        #[command(subcommand)]
+        action: ConfigCmd,
+    },
+
+    /// Run the overlay in the foreground (used internally by `start`)
+    #[command(hide = true)]
+    Run,
 }
 
 #[derive(Subcommand)]
 enum ConfigCmd {
-    /// Print the path of the config file
+    /// Print the path of the settings file
     Path,
     /// Print the current settings
     Show,
@@ -119,7 +123,7 @@ fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Run => platform::run_overlay(),
         Command::Config { action } => config_cmd(action),
-        Command::Crosshair { action } => crosshair(action.unwrap_or(Crosshair::Start)),
+        other => crosshair(other),
     }
 }
 
@@ -128,7 +132,13 @@ fn config_cmd(action: ConfigCmd) -> Result<()> {
         ConfigCmd::Path => println!("{}", Config::path()?.display()),
         ConfigCmd::Show => println!("{}", serde_json::to_string_pretty(&Config::load())?),
         ConfigCmd::Reset => {
-            Config::default().save()?;
+            // Keep the hint counter monotonic, or the overlay would mistake a
+            // reset for a hint it has already shown.
+            let cfg = Config {
+                notice_id: Config::load().notice_id.wrapping_add(1),
+                ..Default::default()
+            };
+            cfg.save()?;
             println!("settings reset to defaults");
         }
     }
@@ -142,12 +152,39 @@ fn update(f: impl FnOnce(&mut Config) -> Result<()>) -> Result<()> {
     cfg.save()
 }
 
+/// Like [`update`], but also raises a hint panel describing what changed. The
+/// hint is built after the mutation so it reports the new value.
+fn update_with_hint(
+    hint: impl FnOnce(&Config) -> String,
+    f: impl FnOnce(&mut Config) -> Result<()>,
+) -> Result<()> {
+    let mut cfg = Config::load();
+    f(&mut cfg)?;
+    cfg.notice = hint(&cfg);
+    cfg.notice_id = cfg.notice_id.wrapping_add(1);
+    cfg.save()
+}
+
+fn percent(v: f32) -> String {
+    format!("{}%", (v * 100.0).round() as i32)
+}
+
+/// The panel shown when the crosshair is switched on: every key and its value.
+fn full_hint(cfg: &Config) -> String {
+    format!(
+        "Crosshair on\nF1  style    {}\nF2  size     {}\nF3  opacity  {}\nF4  color    {}",
+        cfg.style.as_str(),
+        cfg.size as i32,
+        percent(cfg.opacity),
+        cfg.color,
+    )
+}
+
 fn start() -> Result<()> {
     if daemon::is_running() {
         println!("crosshair is already running");
         return Ok(());
     }
-    // Make sure a config exists before the overlay goes looking for one.
     if Config::path().is_ok_and(|p| !p.exists()) {
         Config::load().save()?;
     }
@@ -162,11 +199,19 @@ fn start() -> Result<()> {
     bail!("the overlay did not come up — run `foghud run` to see why")
 }
 
-fn crosshair(action: Crosshair) -> Result<()> {
-    match action {
-        Crosshair::Start => start()?,
+fn require_color(value: &str) -> Result<()> {
+    if config::is_valid_color(value) {
+        Ok(())
+    } else {
+        bail!("'{value}' is not a colour — use #rrggbb, #aarrggbb, or a name like 'cyan'")
+    }
+}
 
-        Crosshair::Stop => {
+fn crosshair(action: Command) -> Result<()> {
+    match action {
+        Command::Start => start()?,
+
+        Command::Stop => {
             if daemon::stop()? {
                 println!("crosshair stopped");
             } else {
@@ -174,28 +219,35 @@ fn crosshair(action: Crosshair) -> Result<()> {
             }
         }
 
-        Crosshair::Restart => {
+        Command::Restart => {
             daemon::stop()?;
             start()?;
         }
 
-        Crosshair::Toggle => {
-            // The first press of a hotkey doubles as "launch it".
+        Command::Toggle => {
+            // The first press of the hotkey doubles as "launch it".
             if !daemon::is_running() {
-                update(|c| {
+                update_with_hint(full_hint, |c| {
                     c.enabled = true;
                     Ok(())
                 })?;
                 return start();
             }
-            update(|c| {
-                c.enabled = !c.enabled;
-                Ok(())
-            })?;
+            if Config::load().enabled {
+                update(|c| {
+                    c.enabled = false;
+                    Ok(())
+                })?;
+            } else {
+                update_with_hint(full_hint, |c| {
+                    c.enabled = true;
+                    Ok(())
+                })?;
+            }
         }
 
-        Crosshair::On => {
-            update(|c| {
+        Command::On => {
+            update_with_hint(full_hint, |c| {
                 c.enabled = true;
                 Ok(())
             })?;
@@ -204,12 +256,12 @@ fn crosshair(action: Crosshair) -> Result<()> {
             }
         }
 
-        Crosshair::Off => update(|c| {
+        Command::Off => update(|c| {
             c.enabled = false;
             Ok(())
         })?,
 
-        Crosshair::Status => {
+        Command::Status => {
             let cfg = Config::load();
             if daemon::is_running() {
                 let vis = if cfg.enabled { "visible" } else { "hidden" };
@@ -219,78 +271,117 @@ fn crosshair(action: Crosshair) -> Result<()> {
             }
         }
 
-        Crosshair::Color { value } => update(|c| {
-            if !config::is_valid_color(&value) {
-                bail!("'{value}' is not a colour — use #rrggbb, #aarrggbb, or a name like 'cyan'");
-            }
-            c.color = value;
-            Ok(())
-        })?,
+        Command::Color { value } => {
+            require_color(&value)?;
+            update_with_hint(
+                |c| format!("color    {}", c.color),
+                |c| {
+                    c.color = value;
+                    Ok(())
+                },
+            )?
+        }
 
-        Crosshair::OutlineColor { value } => update(|c| {
-            if !config::is_valid_color(&value) {
-                bail!("'{value}' is not a colour — use #rrggbb, #aarrggbb, or a name like 'cyan'");
-            }
-            c.outline_color = value;
-            Ok(())
-        })?,
+        Command::OutlineColor { value } => {
+            require_color(&value)?;
+            update(|c| {
+                c.outline_color = value;
+                Ok(())
+            })?
+        }
 
-        Crosshair::Size { value } => update(|c| {
-            c.size = value.max(0.0);
-            Ok(())
-        })?,
-        Crosshair::Thickness { value } => update(|c| {
-            c.thickness = value.max(1.0);
-            Ok(())
-        })?,
-        Crosshair::Gap { value } => update(|c| {
-            c.gap = value.max(0.0);
-            Ok(())
-        })?,
-        Crosshair::Dot { value } => update(|c| {
-            c.dot = value.max(0.0);
-            Ok(())
-        })?,
-        Crosshair::Outline { value } => update(|c| {
-            c.outline = value.max(0.0);
-            Ok(())
-        })?,
-        Crosshair::Opacity { value } => update(|c| {
-            c.opacity = value.clamp(0.0, 1.0);
-            Ok(())
-        })?,
+        Command::Size { value } => update_with_hint(
+            |c| format!("size     {}", c.size as i32),
+            |c| {
+                c.size = value.max(0.0);
+                Ok(())
+            },
+        )?,
 
-        Crosshair::Style { value } => update(|c| {
+        Command::Opacity { value } => update_with_hint(
+            |c| format!("opacity  {}", percent(c.opacity)),
+            |c| {
+                c.opacity = value.clamp(0.0, 1.0);
+                Ok(())
+            },
+        )?,
+
+        Command::Style { value } => {
             let Some(style) = Style::parse(&value) else {
                 bail!("unknown style '{value}' — pick one of: cross, tcross, circle, dot");
             };
-            c.style = style;
+            update_with_hint(
+                |c| format!("style    {}", c.style.as_str()),
+                |c| {
+                    c.style = style;
+                    Ok(())
+                },
+            )?
+        }
+
+        Command::Thickness { value } => update(|c| {
+            c.thickness = value.max(1.0);
             Ok(())
         })?,
-
-        Crosshair::Monitor { value } => update(|c| {
+        Command::Gap { value } => update(|c| {
+            c.gap = value.max(0.0);
+            Ok(())
+        })?,
+        Command::Dot { value } => update(|c| {
+            c.dot = value.max(0.0);
+            Ok(())
+        })?,
+        Command::Outline { value } => update(|c| {
+            c.outline = value.max(0.0);
+            Ok(())
+        })?,
+        Command::Monitor { value } => update(|c| {
             c.monitor = value;
             Ok(())
         })?,
-
-        Crosshair::Offset { x, y } => update(|c| {
+        Command::Offset { x, y } => update(|c| {
             c.offset_x = x;
             c.offset_y = y;
             Ok(())
         })?,
-
-        Crosshair::Cycle { what } => update(|c| {
-            match what.as_str() {
-                "style" => c.style = c.style.next(),
-                "size" => c.size = config::next_f32(&config::SIZE_CYCLE, c.size),
-                "opacity" => c.opacity = config::next_f32(&config::OPACITY_CYCLE, c.opacity),
-                "color" | "colour" => {
-                    c.color = config::next_str(&config::COLOR_CYCLE, &c.color).to_string()
-                }
-                other => bail!("cannot cycle '{other}' — try: style, size, opacity, color"),
-            }
+        Command::Hotkeys { value } => update(|c| {
+            c.hotkeys = value;
             Ok(())
         })?,
+
+        Command::Cycle { what } => match what.as_str() {
+            "style" => update_with_hint(
+                |c| format!("style    {}", c.style.as_str()),
+                |c| {
+                    c.style = c.style.next();
+                    Ok(())
+                },
+            )?,
+            "size" => update_with_hint(
+                |c| format!("size     {}", c.size as i32),
+                |c| {
+                    c.size = config::next_f32(&config::SIZE_CYCLE, c.size);
+                    Ok(())
+                },
+            )?,
+            "opacity" => update_with_hint(
+                |c| format!("opacity  {}", percent(c.opacity)),
+                |c| {
+                    c.opacity = config::next_f32(&config::OPACITY_CYCLE, c.opacity);
+                    Ok(())
+                },
+            )?,
+            "color" | "colour" => update_with_hint(
+                |c| format!("color    {}", c.color),
+                |c| {
+                    c.color = config::next_str(&config::COLOR_CYCLE, &c.color).to_string();
+                    Ok(())
+                },
+            )?,
+            other => bail!("cannot cycle '{other}' — try: style, size, opacity, color"),
+        },
+
+        Command::Config { .. } | Command::Run => unreachable!("handled by run()"),
     }
     Ok(())
 }
