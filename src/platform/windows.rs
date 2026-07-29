@@ -23,11 +23,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     HOT_KEY_MODIFIERS, RegisterHotKey, UnregisterHotKey, VK_F1, VK_F2, VK_F3, VK_F4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, GetMessageW, MSG, PostQuitMessage, RegisterClassW, SW_SHOWNOACTIVATE,
-    SetTimer, ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_DESTROY, WM_HOTKEY,
-    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, MSG,
+    PostQuitMessage, RegisterClassW, SW_SHOWNOACTIVATE, SetTimer, ShowWindow, TranslateMessage,
+    ULW_ALPHA, UpdateLayeredWindow, WM_DESTROY, WM_HOTKEY, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
@@ -182,7 +181,7 @@ fn present(hwnd: HWND, rect: RECT, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_HOTKEY => {
             let mut cfg = Config::load();
@@ -265,7 +264,7 @@ fn run_inner() -> Result<()> {
             anyhow::bail!("no display matched monitor = '{}'", cfg.monitor);
         }
 
-        let mut windows: Vec<(HWND, RECT)> = Vec::new();
+        let mut overlays: Vec<(HWND, RECT)> = Vec::new();
         for monitor in &targets {
             let r = monitor.rect;
             let hwnd = CreateWindowExW(
@@ -290,11 +289,11 @@ fn run_inner() -> Result<()> {
 
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             present(hwnd, r, &cfg)?;
-            windows.push((hwnd, r));
+            overlays.push((hwnd, r));
         }
 
         // Hotkeys belong to one window; the first is as good as any.
-        let owner = windows[0].0;
+        let owner = overlays[0].0;
         register_hotkeys(owner, &cfg);
         let _ = SetTimer(Some(owner), CONFIG_POLL_TIMER, 150, None);
 
@@ -314,7 +313,7 @@ fn run_inner() -> Result<()> {
                             unregister_hotkeys(owner);
                         }
                     }
-                    for (hwnd, rect) in &windows {
+                    for (hwnd, rect) in &overlays {
                         let _ = present(*hwnd, *rect, &cfg);
                     }
                 }
@@ -325,7 +324,7 @@ fn run_inner() -> Result<()> {
         }
 
         unregister_hotkeys(owner);
-        for (hwnd, _) in windows {
+        for (hwnd, _) in overlays {
             let _ = DestroyWindow(hwnd);
         }
     }
