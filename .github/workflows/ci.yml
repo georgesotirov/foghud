@@ -26,10 +26,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # smithay-client-toolkit links against libwayland.
+      # smithay-client-toolkit links against libwayland, and its build script
+      # requires xkbcommon unconditionally even though we never open a seat.
       - name: Install Wayland headers
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev
 
       - name: Format
         run: cargo fmt --check
