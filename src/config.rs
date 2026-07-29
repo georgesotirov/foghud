@@ -67,6 +67,49 @@ pub fn next_str<'a>(cycle: &[&'a str], current: &str) -> &'a str {
     }
 }
 
+pub fn percent(v: f32) -> String {
+    format!("{}%", (v * 100.0).round() as i32)
+}
+
+/// Steps one setting to its next preset and returns the hint text for it.
+///
+/// Both the CLI and the Windows hotkey handler go through here, so a hotkey
+/// press behaves identically on either platform and the hint wording can't
+/// drift between them. Returns `None` for an unknown setting name.
+pub fn apply_cycle(cfg: &mut Config, what: &str) -> Option<String> {
+    let hint = match what {
+        "style" => {
+            cfg.style = cfg.style.next();
+            format!("style    {}", cfg.style.as_str())
+        }
+        "size" => {
+            cfg.size = next_f32(&SIZE_CYCLE, cfg.size);
+            format!("size     {}", cfg.size as i32)
+        }
+        "opacity" => {
+            cfg.opacity = next_f32(&OPACITY_CYCLE, cfg.opacity);
+            format!("opacity  {}", percent(cfg.opacity))
+        }
+        "color" | "colour" => {
+            cfg.color = next_str(&COLOR_CYCLE, &cfg.color).to_string();
+            format!("color    {}", cfg.color)
+        }
+        _ => return None,
+    };
+    Some(hint)
+}
+
+/// The panel shown when the crosshair is switched on: every key and its value.
+pub fn full_hint(cfg: &Config) -> String {
+    format!(
+        "Crosshair on\nF1  style    {}\nF2  size     {}\nF3  opacity  {}\nF4  color    {}",
+        cfg.style.as_str(),
+        cfg.size as i32,
+        percent(cfg.opacity),
+        cfg.color,
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Config {
@@ -139,6 +182,13 @@ impl Config {
             }),
             Err(_) => Self::default(),
         }
+    }
+
+    /// Queues a hint panel. The bump is what tells the overlay this is a new
+    /// hint rather than one it has already shown and expired.
+    pub fn set_notice(&mut self, text: String) {
+        self.notice = text;
+        self.notice_id = self.notice_id.wrapping_add(1);
     }
 
     pub fn save(&self) -> Result<()> {

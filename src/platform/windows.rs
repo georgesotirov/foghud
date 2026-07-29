@@ -32,6 +32,7 @@ use windows::core::{BOOL, PCWSTR, w};
 
 use crate::config::{self, Config};
 use crate::render;
+use std::time::{Duration, Instant};
 
 const HOTKEY_STYLE: usize = 1;
 const HOTKEY_SIZE: usize = 2;
@@ -108,11 +109,14 @@ fn selected(cfg: &Config) -> Vec<Monitor> {
 }
 
 /// Paints one window with the current crosshair.
-fn present(hwnd: HWND, rect: RECT, cfg: &Config) -> Result<()> {
+fn present(hwnd: HWND, rect: RECT, cfg: &Config, notice: Option<&str>) -> Result<()> {
     let width = (rect.right - rect.left).max(1);
     let height = (rect.bottom - rect.top).max(1);
 
-    let pixmap = render::draw(cfg, width as u32, height as u32);
+    let mut pixmap = render::draw(cfg, width as u32, height as u32);
+    if let Some(text) = notice {
+        render::draw_hint(&mut pixmap, cfg, text);
+    }
     let bgra = render::to_bgra(&pixmap);
 
     unsafe {
@@ -184,21 +188,20 @@ fn present(hwnd: HWND, rect: RECT, cfg: &Config) -> Result<()> {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_HOTKEY => {
-            let mut cfg = Config::load();
-            match wparam.0 {
-                HOTKEY_STYLE => cfg.style = cfg.style.next(),
-                HOTKEY_SIZE => cfg.size = config::next_f32(&config::SIZE_CYCLE, cfg.size),
-                HOTKEY_OPACITY => {
-                    cfg.opacity = config::next_f32(&config::OPACITY_CYCLE, cfg.opacity)
-                }
-                HOTKEY_COLOR => {
-                    cfg.color = config::next_str(&config::COLOR_CYCLE, &cfg.color).to_string()
-                }
+            let what = match wparam.0 {
+                HOTKEY_STYLE => "style",
+                HOTKEY_SIZE => "size",
+                HOTKEY_OPACITY => "opacity",
+                HOTKEY_COLOR => "color",
                 _ => return LRESULT(0),
+            };
+            let mut cfg = Config::load();
+            if let Some(hint) = config::apply_cycle(&mut cfg, what) {
+                cfg.set_notice(hint);
+                // Saving is enough: the poll timer notices and repaints, so a
+                // hotkey press and a CLI change take exactly the same path.
+                let _ = cfg.save();
             }
-            // Saving is enough: the poll timer notices and repaints, so a hotkey
-            // press and a CLI change take exactly the same path.
-            let _ = cfg.save();
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -288,7 +291,7 @@ fn run_inner() -> Result<()> {
             .context("creating the overlay window")?;
 
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            present(hwnd, r, &cfg)?;
+            present(hwnd, r, &cfg, None)?;
             overlays.push((hwnd, r));
         }
 
@@ -298,11 +301,18 @@ fn run_inner() -> Result<()> {
         let _ = SetTimer(Some(owner), CONFIG_POLL_TIMER, 150, None);
 
         let mut mtime = config_mtime();
+        let mut last_notice_id = cfg.notice_id;
+        let mut notice = String::new();
+        let mut notice_until: Option<Instant> = None;
+        let mut notice_drawn = false;
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
             if message.message == WM_TIMER && message.wParam.0 == CONFIG_POLL_TIMER {
+                let visible = notice_until.is_some_and(|until| Instant::now() < until);
                 let now = config_mtime();
-                if now != mtime {
+                let changed = now != mtime;
+
+                if changed {
                     mtime = now;
                     let previous_hotkeys = cfg.hotkeys;
                     cfg = Config::load();
@@ -313,8 +323,28 @@ fn run_inner() -> Result<()> {
                             unregister_hotkeys(owner);
                         }
                     }
+                    if cfg.notice_id != last_notice_id && !cfg.notice.is_empty() {
+                        last_notice_id = cfg.notice_id;
+                        notice = cfg.notice.clone();
+                        // A full key listing needs reading; a single value is a
+                        // glance.
+                        let secs = if notice.contains('\n') { 4 } else { 2 };
+                        notice_until = Some(Instant::now() + Duration::from_secs(secs));
+                    }
+                }
+
+                // Comparing against what was last painted is what makes an
+                // expiring hint trigger exactly one clearing repaint.
+                let visible_now = notice_until.is_some_and(|until| Instant::now() < until);
+                if changed || visible_now != notice_drawn || visible != visible_now {
+                    notice_drawn = visible_now;
+                    let text = if visible_now {
+                        Some(notice.as_str())
+                    } else {
+                        None
+                    };
                     for (hwnd, rect) in &overlays {
-                        let _ = present(*hwnd, *rect, &cfg);
+                        let _ = present(*hwnd, *rect, &cfg, text);
                     }
                 }
                 continue;

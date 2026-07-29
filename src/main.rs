@@ -6,7 +6,7 @@ mod text;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use config::{Config, Style};
+use config::{Config, Style, full_hint, percent};
 
 #[derive(Parser)]
 #[command(
@@ -160,24 +160,8 @@ fn update_with_hint(
 ) -> Result<()> {
     let mut cfg = Config::load();
     f(&mut cfg)?;
-    cfg.notice = hint(&cfg);
-    cfg.notice_id = cfg.notice_id.wrapping_add(1);
+    cfg.set_notice(hint(&cfg));
     cfg.save()
-}
-
-fn percent(v: f32) -> String {
-    format!("{}%", (v * 100.0).round() as i32)
-}
-
-/// The panel shown when the crosshair is switched on: every key and its value.
-fn full_hint(cfg: &Config) -> String {
-    format!(
-        "Crosshair on\nF1  style    {}\nF2  size     {}\nF3  opacity  {}\nF4  color    {}",
-        cfg.style.as_str(),
-        cfg.size as i32,
-        percent(cfg.opacity),
-        cfg.color,
-    )
 }
 
 fn start() -> Result<()> {
@@ -349,37 +333,14 @@ fn crosshair(action: Command) -> Result<()> {
             Ok(())
         })?,
 
-        Command::Cycle { what } => match what.as_str() {
-            "style" => update_with_hint(
-                |c| format!("style    {}", c.style.as_str()),
-                |c| {
-                    c.style = c.style.next();
-                    Ok(())
-                },
-            )?,
-            "size" => update_with_hint(
-                |c| format!("size     {}", c.size as i32),
-                |c| {
-                    c.size = config::next_f32(&config::SIZE_CYCLE, c.size);
-                    Ok(())
-                },
-            )?,
-            "opacity" => update_with_hint(
-                |c| format!("opacity  {}", percent(c.opacity)),
-                |c| {
-                    c.opacity = config::next_f32(&config::OPACITY_CYCLE, c.opacity);
-                    Ok(())
-                },
-            )?,
-            "color" | "colour" => update_with_hint(
-                |c| format!("color    {}", c.color),
-                |c| {
-                    c.color = config::next_str(&config::COLOR_CYCLE, &c.color).to_string();
-                    Ok(())
-                },
-            )?,
-            other => bail!("cannot cycle '{other}' — try: style, size, opacity, color"),
-        },
+        Command::Cycle { what } => {
+            let mut cfg = Config::load();
+            let Some(hint) = config::apply_cycle(&mut cfg, &what) else {
+                bail!("cannot cycle '{what}' — try: style, size, opacity, color");
+            };
+            cfg.set_notice(hint);
+            cfg.save()?;
+        }
 
         Command::Config { .. } | Command::Run => unreachable!("handled by run()"),
     }
