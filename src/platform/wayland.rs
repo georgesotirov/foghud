@@ -167,6 +167,7 @@ struct App {
     cfg: Config,
     cfg_mtime: Option<SystemTime>,
     panels: Vec<Panel>,
+    needs_rebuild: bool,
     exit: bool,
 }
 
@@ -192,6 +193,7 @@ impl App {
     }
 
     fn rebuild_panels(&mut self, qh: &QueueHandle<Self>) {
+        self.needs_rebuild = false;
         self.panels.clear();
         let outputs: Vec<_> = self.output_state.outputs().collect();
         for (i, output) in outputs.into_iter().enumerate() {
@@ -271,6 +273,10 @@ impl App {
             bind_hotkeys(&self.cfg);
         }
 
+        if self.needs_rebuild {
+            self.rebuild_panels(qh);
+        }
+
         let mtime = config_mtime();
         if mtime == self.cfg_mtime {
             return;
@@ -335,6 +341,7 @@ fn run_inner() -> Result<()> {
         cfg,
         cfg_mtime: config_mtime(),
         panels: Vec::new(),
+        needs_rebuild: false,
         exit: false,
     };
 
@@ -429,10 +436,13 @@ impl OutputHandler for App {
 
 impl LayerShellHandler for App {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
+        // A closed surface is not a reason to quit. Compositors close layer
+        // surfaces for all sorts of transient reasons — a monitor going away, a
+        // config reload — and a background overlay that exits on the first one
+        // is one unplugged cable away from silently disappearing. Drop the panel
+        // and let the next tick rebuild from whatever outputs exist now.
         self.panels.retain(|p| &p.layer != layer);
-        if self.panels.is_empty() {
-            self.exit = true;
-        }
+        self.needs_rebuild = true;
     }
 
     fn configure(
